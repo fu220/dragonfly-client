@@ -250,6 +250,12 @@ fn default_gc_policy_task_ttl() -> Duration {
     Duration::from_secs(21_600)
 }
 
+/// default_gc_policy_cache_task_ttl is the default ttl of the cache task.
+#[inline]
+fn default_gc_policy_cache_task_ttl() -> Duration {
+    Duration::from_secs(21_600)
+}
+
 /// default_gc_policy_dist_threshold is the default threshold of the disk usage to do gc.
 #[inline]
 fn default_gc_policy_dist_threshold() -> ByteSize {
@@ -265,6 +271,18 @@ fn default_gc_policy_dist_high_threshold_percent() -> u8 {
 /// default_gc_policy_dist_low_threshold_percent is the default low threshold percent of the disk usage.
 #[inline]
 fn default_gc_policy_dist_low_threshold_percent() -> u8 {
+    60
+}
+
+/// default_gc_policy_memory_high_threshold_percent is the default high threshold percent of the memory usage.
+#[inline]
+fn default_gc_policy_memory_high_threshold_percent() -> u8 {
+    80
+}
+
+/// default_gc_policy_memory_low_threshold_percent is the default low threshold percent of the memory usage.
+#[inline]
+fn default_gc_policy_memory_low_threshold_percent() -> u8 {
     60
 }
 
@@ -1083,6 +1101,14 @@ pub struct Policy {
     )]
     pub task_ttl: Duration,
 
+    /// cache_task_ttl is the ttl of the cache task.
+    #[serde(
+        default = "default_gc_policy_cache_task_ttl",
+        rename = "cacheTaskTTL",
+        with = "humantime_serde"
+    )]
+    pub cache_task_ttl: Duration,
+
     /// dist_threshold optionally defines a specific disk capacity to be used as the base for
     /// calculating GC trigger points with `dist_high_threshold_percent` and `dist_low_threshold_percent`.
     ///
@@ -1107,6 +1133,16 @@ pub struct Policy {
     #[serde(default = "default_gc_policy_dist_low_threshold_percent")]
     #[validate(range(min = 1, max = 99))]
     pub dist_low_threshold_percent: u8,
+
+    /// memory_high_threshold_percent is the high threshold percent of the memory usage.
+    #[serde(default = "default_gc_policy_memory_high_threshold_percent")]
+    #[validate(range(min = 1, max = 99))]
+    pub memory_high_threshold_percent: u8,
+
+    /// memory_low_threshold_percent is the low threshold percent of the memory usage.
+    #[serde(default = "default_gc_policy_memory_low_threshold_percent")]
+    #[validate(range(min = 1, max = 99))]
+    pub memory_low_threshold_percent: u8,
 }
 
 /// Policy implements Default.
@@ -1115,8 +1151,11 @@ impl Default for Policy {
         Policy {
             dist_threshold: default_gc_policy_dist_threshold(),
             task_ttl: default_gc_policy_task_ttl(),
+            cache_task_ttl: default_gc_policy_cache_task_ttl(),
             dist_high_threshold_percent: default_gc_policy_dist_high_threshold_percent(),
             dist_low_threshold_percent: default_gc_policy_dist_low_threshold_percent(),
+            memory_high_threshold_percent: default_gc_policy_memory_high_threshold_percent(),
+            memory_low_threshold_percent: default_gc_policy_memory_low_threshold_percent(),
         }
     }
 }
@@ -2106,18 +2145,24 @@ key: /etc/ssl/private/client.pem
     #[test]
     fn validate_policy() {
         let valid_policy = Policy {
+            cache_task_ttl: Duration::from_secs(12 * 3600),
             task_ttl: Duration::from_secs(12 * 3600),
             dist_threshold: ByteSize::mb(100),
             dist_high_threshold_percent: 90,
             dist_low_threshold_percent: 70,
+            memory_high_threshold_percent: 90,
+            memory_low_threshold_percent: 70,
         };
         assert!(valid_policy.validate().is_ok());
 
         let invalid_policy = Policy {
+            cache_task_ttl: Duration::from_secs(12 * 3600),
             task_ttl: Duration::from_secs(12 * 3600),
             dist_threshold: ByteSize::mb(100),
             dist_high_threshold_percent: 100,
             dist_low_threshold_percent: 70,
+            memory_high_threshold_percent: 100,
+            memory_low_threshold_percent: 70,
         };
         assert!(invalid_policy.validate().is_err());
     }

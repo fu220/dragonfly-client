@@ -15,15 +15,15 @@
  */
 
 use crate::dynconfig::Dynconfig;
-use dragonfly_api::common::v2::{Peer, PersistentCachePeer, PersistentCacheTask, Task};
+use dragonfly_api::common::v2::{Peer, CachePeer, PersistentCachePeer, PersistentCacheTask, CacheTask, Task};
 use dragonfly_api::manager::v2::Scheduler;
 use dragonfly_api::scheduler::v2::{
     scheduler_client::SchedulerClient as SchedulerGRPCClient, AnnounceHostRequest,
-    AnnouncePeerRequest, AnnouncePeerResponse, AnnouncePersistentCachePeerRequest,
-    AnnouncePersistentCachePeerResponse, DeleteHostRequest, DeletePeerRequest,
-    DeletePersistentCachePeerRequest, DeletePersistentCacheTaskRequest, DeleteTaskRequest,
-    StatPeerRequest, StatPersistentCachePeerRequest, StatPersistentCacheTaskRequest,
-    StatTaskRequest, UploadPersistentCacheTaskFailedRequest,
+    AnnouncePeerRequest, AnnouncePeerResponse, AnnounceCachePeerResponse, AnnounceCachePeerRequest, AnnouncePersistentCachePeerRequest,
+    AnnouncePersistentCachePeerResponse, DeleteHostRequest, DeletePeerRequest, DeleteCachePeerRequest, 
+    DeletePersistentCachePeerRequest, DeletePersistentCacheTaskRequest, DeleteCacheTaskRequest, DeleteTaskRequest,
+    StatPeerRequest, StatCachePeerRequest, StatPersistentCachePeerRequest, StatPersistentCacheTaskRequest,
+    StatTaskRequest, StatCacheTaskRequest, UploadPersistentCacheTaskFailedRequest,
     UploadPersistentCacheTaskFinishedRequest, UploadPersistentCacheTaskStartedRequest,
 };
 use dragonfly_client_config::dfdaemon::Config;
@@ -452,6 +452,74 @@ impl SchedulerClient {
             .await?;
         Ok(())
     }
+
+    /// announce_cache_peer announces the cache peer to the scheduler.
+    #[instrument(skip_all)]
+    pub async fn announce_cache_peer(
+        &self,
+        task_id: &str,
+        peer_id: &str,
+        request: impl tonic::IntoStreamingRequest<Message = AnnounceCachePeerRequest>,
+    ) -> Result<tonic::Response<tonic::codec::Streaming<AnnounceCachePeerResponse>>> {
+        let response = self
+            .client(task_id, Some(peer_id))
+            .await?
+            .announce_cache_peer(request)
+            .await?;
+        Ok(response)
+    }
+
+    /// stat_cache_peer gets the status of the cache peer.
+    #[instrument(skip(self))]
+    pub async fn stat_cache_peer(&self, request: StatCachePeerRequest) -> Result<CachePeer> {
+        let task_id = request.task_id.clone();
+        let request = Self::make_request(request);
+        let response = self
+            .client(task_id.as_str(), None)
+            .await?
+            .stat_cache_peer(request)
+            .await?;
+        Ok(response.into_inner())
+    }
+
+
+    /// delete_peer tells the scheduler that the peer is deleting.
+    #[instrument(skip(self))]
+    pub async fn delete_cache_peer(&self, request: DeleteCachePeerRequest) -> Result<()> {
+        let task_id = request.task_id.clone();
+        let request = Self::make_request(request);
+        self.client(task_id.as_str(), None)
+            .await?
+            .delete_cache_peer(request)
+            .await?;
+        Ok(())
+    }
+
+    /// stat_cache_task gets the status of the cache task.
+    #[instrument(skip(self))]
+    pub async fn stat_cache_task(&self, request: StatCacheTaskRequest) -> Result<CacheTask> {
+        let task_id = request.task_id.clone();
+        let request = Self::make_request(request);
+        let response = self
+            .client(task_id.as_str(), None)
+            .await?
+            .stat_cache_task(request)
+            .await?;
+        Ok(response.into_inner())
+    }
+
+    /// delete_cache_task tells the scheduler that the cache task is deleting.
+    #[instrument(skip(self))]
+    pub async fn delete_cache_task(&self, request: DeleteCacheTaskRequest) -> Result<()> {
+        let task_id = request.task_id.clone();
+        let request = Self::make_request(request);
+        self.client(task_id.as_str(), None)
+            .await?
+            .delete_cache_task(request)
+            .await?;
+        Ok(())
+    }
+
 
     /// client gets the grpc client of the scheduler.
     #[instrument(skip(self))]

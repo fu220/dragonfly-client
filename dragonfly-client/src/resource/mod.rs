@@ -19,3 +19,4 @@ pub mod piece;
 pub mod piece_collector;
 pub mod piece_downloader;
 pub mod task;
+pub mod cache_task;

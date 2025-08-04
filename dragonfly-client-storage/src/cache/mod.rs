@@ -26,6 +26,7 @@ use std::sync::Arc;
 use tokio::io::{AsyncRead, BufReader};
 use tokio::sync::RwLock;
 use tracing::info;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 pub mod lru_cache;
 
@@ -108,13 +109,25 @@ pub struct Cache {
     config: Arc<Config>,
 
     /// size is the size of the cache in bytes.
-    size: u64,
+    size: Arc<AtomicU64>,
 
     /// capacity is the maximum capacity of the cache in bytes.
     capacity: u64,
 
+    /// used_size is the used size of the cache in bytes.It is used to determine the cache usage during garbage collection.
+    used_size:  Arc<AtomicU64>,
+
     /// tasks stores the tasks with their task id.
     tasks: Arc<RwLock<LruCache<String, Task>>>,
+}
+
+/// WriteCachePieceResponse is the response of writing a cache piece.
+pub struct WriteCachePieceResponse {
+    /// length is the length of the cache piece.
+    pub length: u64,
+
+    /// hash is the hash of the cache piece.
+    pub hash: String,
 }
 
 /// Cache implements the cache for storing piece content by LRU algorithm.
@@ -123,12 +136,13 @@ impl Cache {
     pub fn new(config: Arc<Config>) -> Self {
         Cache {
             config: config.clone(),
-            size: 0,
+            size: Arc::new(AtomicU64::new(0)),
             capacity: config.storage.cache_capacity.as_u64(),
             // LRU cache capacity is set to usize::MAX to avoid evicting tasks. LRU cache will evict tasks
             // by cache capacity(cache size) itself, and used pop_lru to evict the least recently
             // used task.
             tasks: Arc::new(RwLock::new(LruCache::new(usize::MAX))),
+            used_size: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -178,18 +192,32 @@ impl Cache {
     }
 
     /// write_piece writes the piece content to the cache.
-    pub async fn write_piece(&self, task_id: &str, piece_id: &str, content: Bytes) -> Result<()> {
+    pub async fn write_piece(&self, task_id: &str, piece_id: &str, content: Bytes) -> Result<WriteCachePieceResponse> {
         let mut tasks = self.tasks.write().await;
         let Some(task) = tasks.get(task_id) else {
             return Err(Error::TaskNotFound(task_id.to_string()));
         };
 
+        let mut hasher = crc32fast::Hasher::new();
+        let length = content.len() as u64;  
+        hasher.update(&content);  
+        let hash = hasher.finalize().to_string();
+        
         if task.contains(piece_id).await {
-            return Ok(());
+            return Ok(WriteCachePieceResponse {  
+                length,  
+                hash,  
+            });
         }
 
         task.write_piece(piece_id, content).await;
-        Ok(())
+
+        self.used_size.fetch_add(length, Ordering::Relaxed);
+
+        Ok(WriteCachePieceResponse {  
+            length,  
+            hash,  
+        })
     }
 
     /// put_task puts a new task into the cache, constrained by the capacity of the cache.
@@ -210,10 +238,11 @@ impl Cache {
         }
 
         let mut tasks = self.tasks.write().await;
-        while self.size + content_length > self.capacity {
+        while self.size.load(Ordering::Relaxed) + content_length > self.capacity {
             match tasks.pop_lru() {
                 Some((_, task)) => {
-                    self.size -= task.content_length();
+                    self.size.fetch_sub(task.content_length(), Ordering::Relaxed);
+                    self.used_size.fetch_sub(task.content_length(), Ordering::Relaxed);
                 }
                 None => {
                     break;
@@ -223,7 +252,7 @@ impl Cache {
 
         let task = Task::new(content_length);
         tasks.put(task_id.to_string(), task);
-        self.size += content_length;
+        self.size.fetch_add(content_length, Ordering::Relaxed);
     }
 
     pub async fn delete_task(&mut self, task_id: &str) -> Result<()> {
@@ -232,7 +261,8 @@ impl Cache {
             return Err(Error::TaskNotFound(task_id.to_string()));
         };
 
-        self.size -= task.content_length();
+        self.size.fetch_sub(task.content_length(), Ordering::Relaxed);
+        self.used_size.fetch_sub(task.content_length(), Ordering::Relaxed);
         Ok(())
     }
 
@@ -250,6 +280,16 @@ impl Cache {
         } else {
             false
         }
+    }
+
+    /// capacity returns the capacity of the cache.
+    pub fn capacity(&self) -> u64 {
+        self.capacity
+    }
+
+    /// used_size returns the used size of the cache.
+    pub fn used_size(&self) -> u64 {
+        self.used_size.load(Ordering::Relaxed)
     }
 }
 
@@ -295,7 +335,7 @@ mod tests {
 
         for (config, expected_size, expected_capacity) in test_cases {
             let cache = Cache::new(Arc::new(config));
-            assert_eq!(cache.size, expected_size);
+            assert_eq!(cache.size.load(Ordering::Relaxed), expected_size);
             assert_eq!(cache.capacity, expected_capacity);
         }
     }
@@ -983,5 +1023,6 @@ mod tests {
         let mut buffer = Vec::new();
         reader.read_to_end(&mut buffer).await.unwrap();
         assert_eq!(buffer, original_content);
-    }
-}
+     }
+ }
+ 

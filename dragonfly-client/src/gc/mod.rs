@@ -17,7 +17,7 @@
 use crate::grpc::scheduler::SchedulerClient;
 use crate::shutdown;
 use chrono::Utc;
-use dragonfly_api::scheduler::v2::DeleteTaskRequest;
+use dragonfly_api::scheduler::v2::{DeleteCacheTaskRequest, DeleteTaskRequest};
 use dragonfly_client_config::dfdaemon::Config;
 use dragonfly_client_core::Result;
 use dragonfly_client_storage::{metadata, Storage};
@@ -99,6 +99,16 @@ impl GC {
                     // Evict the cache by disk usage.
                     if let Err(err) = self.evict_task_by_disk_usage().await {
                         info!("failed to evict task by disk usage: {}", err);
+                    }
+
+                    // Evict the cache by ttl.
+                    if let Err(err) = self.evict_cache_task_by_ttl().await {
+                        info!("failed to evict cache task by ttl: {}", err);
+                    }
+
+                    // Evict the cache by memory usage.
+                    if let Err(err) = self.evict_cache_task_by_memory_usage().await {
+                        info!("failed to evict cache task by memory usage: {}", err);
                     }
                 }
                 _ = shutdown.recv() => {
@@ -321,6 +331,126 @@ impl GC {
                 "evict persistent cache task {} size {}",
                 task.id, task_space
             );
+        }
+
+        info!("evict total size {}", evicted_space);
+        Ok(())
+    }
+
+    /// evict_cache_task_by_ttl evicts the cache task by ttl.
+    #[instrument(skip_all)]
+    async fn evict_cache_task_by_ttl(&self) -> Result<()> {
+        info!("start to evict by cache task ttl");
+        for task in self.storage.get_cache_tasks()? {
+            // If the task is expired and not uploading, evict the task.
+            if task.is_expired(self.config.gc.policy.cache_task_ttl) {
+                self.storage.delete_cache_task(&task.id).await;
+                info!("evict cache task {}", task.id);
+
+                self.delete_cache_task_from_scheduler(task.clone()).await;
+                info!("delete cache task {} from scheduler", task.id);
+            }
+        }
+
+        info!("evict by cache task ttl done");
+        Ok(())
+    }
+
+    /// delete_cache_task_from_scheduler deletes the cache task from the scheduler.
+    #[instrument(skip_all)]
+    async fn delete_cache_task_from_scheduler(&self, task: metadata::CacheTask) {
+        self.scheduler_client
+            .delete_cache_task(DeleteCacheTaskRequest {
+                host_id: self.host_id.clone(),
+                task_id: task.id.clone(),
+            })
+            .await
+            .unwrap_or_else(|err| {
+                error!("failed to delete peer {}: {}", task.id, err);
+            });
+    }
+
+    /// evict_cache_task_by_memory_usage evicts the cache task by memory usage.
+    #[instrument(skip_all)]
+    async fn evict_cache_task_by_memory_usage(&self) -> Result<()> {
+        let used_size = self.storage.cache_used_size();
+        let capacity = self.storage.cache_capacity();
+        
+        // Calculate the usage percent.
+        let usage_percent = ( used_size / capacity * 100) as u8;
+        if usage_percent >= self.config.gc.policy.memory_high_threshold_percent {
+            info!(
+                "start to evict cache task by memory usage, memory usage {}% is higher than high threshold {}%",
+                usage_percent, self.config.gc.policy.memory_high_threshold_percent
+            );
+
+            // Calculate the need evict space.
+            let need_evict_space = capacity as f64
+                * ((usage_percent - self.config.gc.policy.memory_low_threshold_percent) as f64
+                    / 100.0);
+
+            // Evict the task by the need evict space.
+            if let Err(err) = self.evict_cache_task_space(need_evict_space as u64).await {
+                info!("failed to evict cache task by memory usage: {}", err);
+            }
+
+            info!("evict cache task by memory usage done");
+        }
+
+        Ok(())
+    }
+
+    /// evict_cache_task_space evicts the cache task by the given space.
+    #[instrument(skip_all)]
+    async fn evict_cache_task_space(&self, need_evict_space: u64) -> Result<()> {
+        let mut tasks = self.storage.get_cache_tasks()?;
+        tasks.sort_by(|a, b| a.updated_at.cmp(&b.updated_at));
+
+        let mut evicted_space = 0;
+        for task in tasks {
+            // Evict enough space.
+            if evicted_space >= need_evict_space {
+                break;
+            }
+            
+            // If the cache task has downloaded finished, task has the content length, evicted space is the
+            // content length. If the task has started and did not download the data, and content
+            // length is 0, evicted space is 0.
+            let task_space = match task.cache_task_length() {
+                Some(content_length) => content_length,
+                None => {
+                    // If the task has no content length, skip it.
+                    if !task.is_failed() {
+                        error!("cache task {} has no content length", task.id);
+                        continue;
+                    }
+
+                    // If the task has started and did not download the data, and content length is 0.
+                    info!("cache task {} is failed, has no content length", task.id);
+                    0
+                }
+            };
+
+            //  If the task is started and not finished, and the task download is not timeout,
+            //  skip it.
+            if task.is_started()
+                && !task.is_finished()
+                && !task.is_failed()
+                && (task.created_at + DOWNLOAD_TASK_TIMEOUT > Utc::now().naive_utc())
+            {
+                info!("cache task {} is started and not finished, skip it", task.id);
+                continue;
+            }
+
+            // Evict the task.
+            self.storage.delete_cache_task(&task.id).await;
+
+            // Update the evicted space.
+            evicted_space += task_space;
+            info!("evict cache task {} size {}", task.id, task_space);
+
+            self.delete_cache_task_from_scheduler(task.clone()).await;
+            info!("delete cache task {} from scheduler", task.id);
         }
 
         info!("evict total size {}", evicted_space);

@@ -15,7 +15,7 @@
  */
 
 use crate::grpc::dfdaemon_upload::DfdaemonUploadClient;
-use dragonfly_api::dfdaemon::v2::{DownloadPersistentCachePieceRequest, DownloadPieceRequest};
+use dragonfly_api::dfdaemon::v2::{DownloadCachePieceRequest, DownloadPersistentCachePieceRequest, DownloadPieceRequest};
 use dragonfly_client_config::dfdaemon::Config;
 use dragonfly_client_core::{Error, Result};
 use dragonfly_client_storage::metadata;
@@ -48,6 +48,15 @@ pub trait Downloader: Send + Sync {
     /// download_persistent_cache_piece downloads a persistent cache piece from the other peer by different
     /// protocols.
     async fn download_persistent_cache_piece(
+        &self,
+        addr: &str,
+        number: u32,
+        host_id: &str,
+        task_id: &str,
+    ) -> Result<(Vec<u8>, u64, String)>;
+
+    /// download_cache_piece downloads a cache piece from the other peer by different protocols.
+    async fn download_cache_piece(
         &self,
         addr: &str,
         number: u32,
@@ -354,6 +363,75 @@ impl Downloader for GRPCDownloader {
         let response = match client
             .download_persistent_cache_piece(
                 DownloadPersistentCachePieceRequest {
+                    host_id: host_id.to_string(),
+                    task_id: task_id.to_string(),
+                    piece_number: number,
+                },
+                self.config.download.piece_timeout,
+            )
+            .await
+        {
+            Ok(response) => response,
+            Err(err) => {
+                // If the request fails, it will drop the request guard and remove the client
+                // entry to avoid using the invalid client.
+                drop(request_guard);
+                self.remove_client_entry(addr).await;
+                return Err(err);
+            }
+        };
+
+        let Some(piece) = response.piece else {
+            return Err(Error::InvalidParameter);
+        };
+
+        let Some(content) = piece.content else {
+            return Err(Error::InvalidParameter);
+        };
+
+        // Calculate the digest of the piece metadata and compare it with the expected digest,
+        // it verifies the integrity of the piece metadata.
+        let piece_metadata = metadata::Piece {
+            number,
+            length: piece.length,
+            offset: piece.offset,
+            digest: piece.digest.clone(),
+            ..Default::default()
+        };
+
+        if let Some(expected_digest) = response.digest {
+            let digest = piece_metadata.calculate_digest();
+            if expected_digest != digest {
+                return Err(Error::DigestMismatch(
+                    expected_digest.to_string(),
+                    digest.to_string(),
+                ));
+            }
+        }
+
+        Ok((content, piece.offset, piece.digest))
+    }
+
+    /// download_cache_piece downloads a cache piece from the other peer by the gRPC protocol.
+    #[instrument(skip_all)]
+    async fn download_cache_piece(
+        &self,
+        addr: &str,
+        number: u32,
+        host_id: &str,
+        task_id: &str,
+    ) -> Result<(Vec<u8>, u64, String)> {
+        let client = self.client(addr).await?;
+
+        let entry = self
+            .get_client_entry(addr)
+            .await
+            .ok_or(Error::UnexpectedResponse)?;
+        let request_guard = RequestGuard::new(entry.active_requests.clone());
+
+        let response = match client
+            .download_cache_piece(
+                DownloadCachePieceRequest {
                     host_id: host_id.to_string(),
                     task_id: task_id.to_string(),
                     piece_number: number,
